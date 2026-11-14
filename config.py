@@ -1,7 +1,11 @@
-"""Central configuration for the Indian Traffic Intelligent Car (DQN) simulator.
+"""Central configuration for the Intelli-Car (DQN) Indian traffic simulator.
 
 All tunable numbers live here so that the environment, the agent and the
 training loop never contain magic constants.  World units are pixels.
+
+The simulator now has four driving scenarios (see SCENARIOS below). The agent is
+trained on each scenario in turn, each with its own number of episodes, and is
+then tested on all four.
 """
 
 import os
@@ -11,15 +15,15 @@ import os
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
-BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "dqn_best.pth")
+RESULTS_DIR = os.path.join(BASE_DIR, "results")
 LAST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "dqn_last.pth")
+FINAL_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "dqn_final.pth")
 SAVE_EVERY_EPISODES = 25
 
 # ---------------------------------------------------------------------------
 # Training hyper-parameters (as requested)
 # ---------------------------------------------------------------------------
-EPISODES = 200
-MAX_STEPS = 500
+EPISODES = 200                 # episodes per scenario (each scenario below can override it)
 LEARNING_RATE = 0.001
 GAMMA = 0.99
 EPSILON_START = 1.0
@@ -37,9 +41,35 @@ REWARD_SCALE = 0.05            # rewards are multiplied by this inside the loss 
 SEED = 42
 
 # ---------------------------------------------------------------------------
+# Staged training and the final test
+# ---------------------------------------------------------------------------
+SCENARIO_ORDER = ["highway", "heavy_traffic", "single_lane", "u_turn"]
+
+# Episodes the agent spends in each scenario (edit one entry to change only that scenario).
+EPISODES_PER_SCENARIO = {
+    "highway": EPISODES,
+    "heavy_traffic": EPISODES,
+    "single_lane": EPISODES,
+    "u_turn": EPISODES,
+}
+
+# Optional extra phase after the four scenarios: every episode picks a random scenario,
+# which helps the agent keep what it learned in earlier scenarios. 0 turns it off.
+MIXED_EPISODES = 0
+
+# Epsilon is raised to this value at the start of every scenario after the first,
+# so the agent explores the new road layout instead of only repeating old habits.
+STAGE_EPSILON_RESTART = 0.6
+
+FINAL_TEST_EPISODES = 20       # greedy test episodes per scenario at the end
+TEST_SEED = 1234               # test episode i uses seed TEST_SEED + i, so tests are repeatable
+
+# ---------------------------------------------------------------------------
 # State / action spaces
 # ---------------------------------------------------------------------------
-STATE_SIZE = 8                 # [car_x, car_y, front_distance, left_gap, right_gap, current_lane, speed, closing_speed]
+# State: [car_x, mission_progress, front_distance, left_gap, right_gap, current_lane,
+#         speed, closing_speed, u_turn_gap_distance, u_turn_done]
+STATE_SIZE = 10
 ACTION_SIZE = 7
 NORMALIZE_STATE = True         # False returns raw pixel values instead of normalised values
 
@@ -48,8 +78,8 @@ ACTION_RIGHT = 1
 ACTION_FORWARD = 2
 ACTION_DIAGONAL_LEFT = 3
 ACTION_DIAGONAL_RIGHT = 4
-ACTION_SLOW = 5                # new: ease off the throttle / gentle brake
-ACTION_STOP = 6                # new: hard brake until the car stands still
+ACTION_SLOW = 5                # ease off the throttle / gentle brake
+ACTION_STOP = 6                # hard brake until the car stands still
 
 ACTION_NAMES = {
     0: "LEFT",
@@ -93,7 +123,7 @@ ACTION_EFFECTS = {
 # ---------------------------------------------------------------------------
 # Safety layer: predicts the next step and overrides actions that would hit something.
 # Fallback order: dodge while holding speed, dodge while slowing, dodge while stopping,
-# then straight slow, then straight stop.
+# then straight slow, then straight stop. Replacement moves never cross the double line.
 # ---------------------------------------------------------------------------
 SAFETY_SHIELD = True
 SHIELD_MARGIN = 6.0            # extra bumper gap (px) that must remain after braking distance
@@ -111,28 +141,109 @@ RENDER_TRAINING = True
 EGO_SCREEN_Y = 540             # the ego car stays at this screen row, the world scrolls
 
 # ---------------------------------------------------------------------------
-# Road geometry (left-hand traffic like India):
-#   lanes 0,1,2 -> forward lanes (same direction as the ego car, left half)
-#   lanes 3,4,5 -> opposite-direction lanes (right half)
+# Road drawing (left-hand traffic like India). The road is always centred on
+# ROAD_CENTER_X; its width depends on the scenario's lanes_per_side and lane_width.
+#   lanes 0 .. n-1   : forward lanes (same direction as the ego car, left half)
+#   double yellow line in the middle (solid: crossing it is not allowed)
+#   lanes n .. 2n-1  : oncoming lanes (right half)
 # ---------------------------------------------------------------------------
-NUM_LANES = 6
-FORWARD_LANES = (0, 1, 2)
-OPPOSITE_LANES = (3, 4, 5)
-LANE_WIDTH = 78
-ROAD_WIDTH = NUM_LANES * LANE_WIDTH
-ROAD_LEFT = 120
-ROAD_RIGHT = ROAD_LEFT + ROAD_WIDTH
-PANEL_X = ROAD_RIGHT + 36
+ROAD_CENTER_X = 354
+PANEL_X = 624
 
 DASH_LENGTH = 34
 DASH_GAP = 26
 
-DESTINATION_DISTANCE = 2000.0
+# ---------------------------------------------------------------------------
+# Scenarios
+#   lanes_per_side     lanes in each direction
+#   lane_width         px per lane
+#   jitter_scale       how far moving vehicles wander inside their lane (0 = dead centre)
+#   forward_vehicles   target number of moving vehicles in the ego's direction
+#   opposite_vehicles  target number of oncoming moving vehicles
+#   speed_scale        multiplies every moving vehicle's speed range (slow = heavy traffic)
+#   spawn_gap          minimum bumper-to-bumper gap when a vehicle is created
+#   spawn_probability  chance per step that a new vehicle is added when below target
+#   parked             whether parked vehicles line the kerbs
+#   destination        finish line distance (px from the start)
+#   max_steps          safety cap on episode length (generous: slow traffic needs time)
+#   u_turn             True when the median has an opening where the car must turn back
+#   u_turn_gap_center  position of the opening along the road
+#   u_turn_gap_length  length of the opening
+#   return_finish      finish line position (in the original road coordinates) after the U-turn
+# ---------------------------------------------------------------------------
+SCENARIOS = {
+    "highway": {
+        "title": "Highway - 3 lanes each way",
+        "lanes_per_side": 3,
+        "lane_width": 78,
+        "jitter_scale": 1.0,
+        "forward_vehicles": 8,
+        "opposite_vehicles": 10,
+        "speed_scale": 1.0,
+        "spawn_gap": 45.0,
+        "spawn_probability": 0.25,
+        "parked": True,
+        "destination": 2000.0,
+        "max_steps": 3000,
+        "u_turn": False,
+    },
+    "heavy_traffic": {
+        "title": "Heavy slow traffic - 3 lanes each way",
+        "lanes_per_side": 3,
+        "lane_width": 78,
+        "jitter_scale": 1.0,
+        "forward_vehicles": 14,
+        "opposite_vehicles": 12,
+        "speed_scale": 0.45,
+        "spawn_gap": 26.0,
+        "spawn_probability": 0.4,
+        "parked": True,
+        "destination": 1400.0,
+        "max_steps": 8000,
+        "u_turn": False,
+    },
+    "single_lane": {
+        "title": "Narrow road - 1 lane each way",
+        "lanes_per_side": 1,
+        "lane_width": 84,
+        "jitter_scale": 0.0,
+        "forward_vehicles": 5,
+        "opposite_vehicles": 5,
+        "speed_scale": 0.9,
+        "spawn_gap": 45.0,
+        "spawn_probability": 0.25,
+        "parked": False,
+        "destination": 1800.0,
+        "max_steps": 6000,
+        "u_turn": False,
+    },
+    "u_turn": {
+        "title": "U-turn road - 2 lanes each way",
+        "lanes_per_side": 2,
+        "lane_width": 78,
+        "jitter_scale": 1.0,
+        "forward_vehicles": 6,
+        "opposite_vehicles": 5,
+        "speed_scale": 0.9,
+        "spawn_gap": 45.0,
+        "spawn_probability": 0.25,
+        "parked": True,
+        "destination": 0.0,
+        "max_steps": 6000,
+        "u_turn": True,
+        "u_turn_gap_center": 650.0,
+        "u_turn_gap_length": 240.0,
+        "return_finish": 60.0,
+    },
+}
 
-# The yellow divider is solid: when False the ego car cannot cross into the
-# oncoming lanes (they remain dangerous scenery). Set True to allow overtaking
-# through the oncoming lanes (much harder to learn).
-ALLOW_OPPOSITE_LANES = False
+# ---------------------------------------------------------------------------
+# Time limits: the agent gets plenty of time. An episode ends early only when the
+# scenario's max_steps cap is reached or the car makes no real forward progress for
+# a very long time.
+# ---------------------------------------------------------------------------
+STUCK_WINDOW_STEPS = 600       # steps without enough progress before the episode is ended as "stuck"
+STUCK_MIN_PROGRESS = 20.0      # px of forward progress that counts as "not stuck"
 
 # ---------------------------------------------------------------------------
 # Ego car
@@ -141,11 +252,6 @@ EGO_WIDTH = 38
 EGO_LENGTH = 72
 EGO_COLOR = (30, 110, 255)
 COLLISION_SHRINK = 1.0
-
-# Region the ego car may drive in (derived from ALLOW_OPPOSITE_LANES)
-EGO_LEFT_LIMIT = ROAD_LEFT
-EGO_RIGHT_LIMIT = ROAD_RIGHT if ALLOW_OPPOSITE_LANES else ROAD_LEFT + len(FORWARD_LANES) * LANE_WIDTH - 4
-EGO_MAX_LANE = (NUM_LANES - 1) if ALLOW_OPPOSITE_LANES else (len(FORWARD_LANES) - 1)
 
 # ---------------------------------------------------------------------------
 # Vehicle catalogue
@@ -178,15 +284,12 @@ MOVING_TYPE_WEIGHTS = {"bike": 0.28, "auto": 0.22, "car": 0.30, "bus": 0.10, "tr
 PARKED_TYPE_WEIGHTS = {"car": 0.45, "auto": 0.20, "bike": 0.15, "truck": 0.12, "bus": 0.08}
 
 # ---------------------------------------------------------------------------
-# Traffic behaviour
+# Traffic behaviour (shared by all scenarios)
 # ---------------------------------------------------------------------------
 SPAWN_AHEAD = 800.0            # moving traffic appears this far ahead of the ego car
 DESPAWN_BEHIND = 300.0
-TARGET_FORWARD_VEHICLES = 8
-TARGET_OPPOSITE_VEHICLES = 10
-SPAWN_PROBABILITY = 0.25
-SPAWN_GAP = 45.0               # minimum bumper-to-bumper gap between vehicles at spawn time
 INITIAL_CLEAR_ZONE = 160.0     # nothing spawns this close to the ego car at reset
+POPULATE_ATTEMPTS = 900        # tries when filling the road at reset or after a U-turn
 
 SAFE_GAP_BASE = 18.0           # safe gap = base + speed * time
 SAFE_GAP_TIME = 10.0
@@ -199,7 +302,7 @@ LANE_CHANGE_SPEED = 2.0
 LANE_CHANGE_COOLDOWN = 90
 LANE_CHANGE_CLEARANCE = 55.0
 LANE_CHANGE_TRIGGER_RATIO = 0.8
-STUCK_LIMIT = 180
+STUCK_LIMIT = 180              # steps a moving NPC may stand still before it is removed
 
 PARKED_START = 250.0
 PARKED_END_EXTRA = 400.0
@@ -214,6 +317,7 @@ FRONT_SENSOR_RANGE = 300.0
 SIDE_SENSOR_RANGE = 160.0
 SIDE_LONGITUDINAL_MARGIN = 45.0
 FRONT_BAND_MARGIN = 4.0
+GAP_SENSOR_RANGE = 800.0       # how far ahead the car "sees" the U-turn opening
 
 # ---------------------------------------------------------------------------
 # Rewards (as requested)
@@ -235,7 +339,21 @@ IDLE_SPEED = 0.5               # below this speed the car counts as standing sti
 IDLE_CLEAR_GAP = 120.0         # standing still with at least this much free road ahead is idling
 IDLE_PENALTY = -2.0
 CLOSING_SPEED_THRESHOLD = 0.5  # front gap only counts as "very close" while approaching faster than this
-TIMEOUT_PENALTY = -100.0       # running out of steps without reaching the destination
+TIMEOUT_PENALTY = -100.0       # running out of steps (or being stuck) without reaching the finish line
+
+# Double yellow line: no crossing and therefore no overtaking, in any condition.
+# The only exception is the U-turn opening in the U-turn scenario.
+PENALTY_DOUBLE_LINE = -100.0       # when the car crosses the double line
+PENALTY_DOUBLE_LINE_STEP = -5.0    # every further step spent over the line (when the episode continues)
+END_EPISODE_ON_VIOLATION = True    # crossing the line ends the episode as a failure
+
+# U-turn scenario
+REWARD_U_TURN = 100.0              # completing the U-turn through the opening
+PENALTY_MISSED_TURN = -100.0       # driving past the opening without turning back
+MISSED_TURN_MARGIN = 120.0         # px beyond the end of the opening before the turn counts as missed
+U_TURN_ALIGN_RANGE = 300.0         # distance before the opening at which the car is nudged towards the median
+U_TURN_SHAPING_FORWARD = 0.03      # reward per px of progress towards the opening
+U_TURN_SHAPING_LATERAL = 0.08      # reward per px of sideways progress towards the opening's crossing point
 
 # ---------------------------------------------------------------------------
 # Colours

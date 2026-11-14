@@ -6,6 +6,7 @@ Coordinate system
 * s is the position along the road in world units (pixels). Forward lanes move
   towards increasing s, opposite lanes towards decreasing s.
 * The camera follows the ego car, so screen_y = EGO_SCREEN_Y - (s - ego_s).
+* Lane layout and road edges come from a Road object (models/road.py).
 """
 
 import math
@@ -19,24 +20,6 @@ import config
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def lane_center_x(lane):
-    return config.ROAD_LEFT + (lane + 0.5) * config.LANE_WIDTH
-
-
-def lane_from_x(x):
-    lane = int((x - config.ROAD_LEFT) // config.LANE_WIDTH)
-    return max(0, min(config.NUM_LANES - 1, lane))
-
-
-def lane_direction(lane):
-    """+1 for forward lanes, -1 for oncoming lanes."""
-    return 1 if lane in config.FORWARD_LANES else -1
-
-
-def lanes_in_same_group(lane):
-    return config.FORWARD_LANES if lane in config.FORWARD_LANES else config.OPPOSITE_LANES
-
-
 def world_to_screen_y(s, ego_s):
     return config.EGO_SCREEN_Y - (s - ego_s)
 
@@ -157,41 +140,30 @@ def draw_vehicle_body(surface, rect, vtype, color, heading, parked=False, is_ego
 # NPC vehicles
 # ---------------------------------------------------------------------------
 class Vehicle(Body):
-    def __init__(self, vtype, lane, s, speed, parked=False):
+    def __init__(self, road, vtype, lane, s, speed, parked=False):
         spec = config.VEHICLE_TYPES[vtype]
         width = spec["width"]
         length = spec["length"]
 
         if parked:
-            if lane == 0:
-                x = config.ROAD_LEFT + width / 2.0 + config.PARKED_EDGE_MARGIN
-            else:
-                x = config.ROAD_RIGHT - width / 2.0 - config.PARKED_EDGE_MARGIN
+            x = road.parked_x(lane, width)
         else:
-            x = lane_center_x(lane) + self._random_jitter(width)
+            x = road.jittered_lane_x(lane, width)
 
         super().__init__(x, s, width, length)
 
+        self.road = road
         self.vtype = vtype
         self.lane = lane
         self.target_lane = lane
         self.target_x = self.x
-        self.direction = lane_direction(lane)
+        self.direction = road.lane_direction(lane)
         self.parked = parked
         self.speed = 0.0 if parked else float(speed)
         self.target_speed = 0.0 if parked else float(speed)
         self.color = random.choice(spec["colors"])
         self.cooldown = 0
         self.stuck = 0
-
-    @staticmethod
-    def _random_jitter(width):
-        room = max(0.0, (config.LANE_WIDTH - width) / 2.0 - 4.0)
-        return random.uniform(-1.0, 1.0) * room * 0.5
-
-    @staticmethod
-    def jittered_lane_x(lane, width):
-        return lane_center_x(lane) + Vehicle._random_jitter(width)
 
     def start_lane_change(self, new_lane, new_x):
         self.target_lane = new_lane
@@ -233,8 +205,9 @@ class Vehicle(Body):
 # Ego car
 # ---------------------------------------------------------------------------
 class EgoCar(Body):
-    def __init__(self, x, s=0.0, speed=None):
+    def __init__(self, road, x, s=0.0, speed=None):
         super().__init__(x, s, config.EGO_WIDTH, config.EGO_LENGTH)
+        self.road = road
         self.direction = 1
         self.speed = float(config.EGO_START_SPEED if speed is None else speed)
         self.last_action = config.ACTION_FORWARD
@@ -243,7 +216,7 @@ class EgoCar(Body):
 
     @property
     def lane(self):
-        return lane_from_x(self.x)
+        return self.road.lane_from_x(self.x)
 
     def plan_motion(self, lateral_dir, lateral_speed, mode):
         """Return (x, s, speed) after one step of the given motion without changing the car."""
@@ -266,7 +239,7 @@ class EgoCar(Body):
         steer = max(config.EGO_MIN_STEER, min(1.0, speed / config.EGO_STEER_FULL_SPEED))
         half = self.width / 2.0
         x = self.x + lateral_dir * lateral_speed * steer
-        x = max(config.EGO_LEFT_LIMIT + half, min(config.EGO_RIGHT_LIMIT - half, x))
+        x = max(self.road.left + half, min(self.road.right - half, x))
         s = self.s + speed
         return x, s, speed
 
