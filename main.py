@@ -4,12 +4,18 @@ Scenarios (see config.py):
     highway        3 lanes each way
     heavy_traffic  3 lanes each way, dense and slow
     single_lane    1 lane each way (no overtaking possible)
-    u_turn         2 lanes each way with a U-turn opening in the median
+    curvy_road     1 lane each way on a road that winds from side to side
 
 The agent trains on each scenario in turn (each with its own number of episodes),
 keeping the same network and replay memory, and is then tested on all four
 scenarios with greedy actions. The double yellow line may never be crossed (no
-overtaking in any condition); the only exception is the U-turn opening.
+overtaking in any condition). Every episode lasts at most config.MAX_STEPS steps.
+
+During training the agent is quietly tested on all four scenarios every few episodes and at
+the end of each stage; the best version is kept as checkpoints/dqn_best.pth. The final test
+and test_run.py both use that best model.
+
+To show the trained agent to other people (as many times as you like) use test_run.py.
 
 Usage
 -----
@@ -17,10 +23,10 @@ Usage
     python main.py --no-render              # same, without drawing (much faster)
     python main.py --fast                   # draw only every few frames
     python main.py --episodes 100           # 100 episodes per scenario
-    python main.py --stage u_turn           # train only one scenario (then final test)
-    python main.py --load checkpoints/dqn_last.pth --stage u_turn
-    python main.py --eval checkpoints/dqn_final.pth                   # final test only
-    python main.py --eval checkpoints/dqn_final.pth --scenario u_turn # test one scenario
+    python main.py --stage curvy_road       # train only one scenario (then final test)
+    python main.py --load checkpoints/dqn_last.pth --stage curvy_road
+    python main.py --eval checkpoints/dqn_best.pth                       # final test only
+    python main.py --eval checkpoints/dqn_best.pth --scenario curvy_road  # test one scenario
 
 Keys while running: ESC quit, R toggle rendering, F toggle fast mode.
 """
@@ -39,6 +45,7 @@ import torch
 import config
 from agent.dqn_agent import DQNAgent
 from env.traffic_env import TrafficEnv
+from utils.evaluation import overall, print_table, save_results, summarize
 
 TRAIN_LOG_PATH = os.path.join(config.RESULTS_DIR, "training_log.csv")
 TEST_CSV_PATH = os.path.join(config.RESULTS_DIR, "final_test.csv")
@@ -46,7 +53,7 @@ TEST_JSON_PATH = os.path.join(config.RESULTS_DIR, "final_test.json")
 
 TRAIN_LOG_FIELDS = [
     "stage", "stage_episode", "episode", "scenario", "reward", "steps", "outcome",
-    "epsilon", "loss", "brake_actions", "auto_brakes", "violations", "u_turn_done", "avg_speed",
+    "epsilon", "loss", "brake_actions", "auto_brakes", "violations", "avg_speed",
 ]
 
 
@@ -96,8 +103,7 @@ def should_draw(flags, step):
 # ---------------------------------------------------------------------------
 def run_episode(env, agent, scenario, flags, clock, training, hud_prefix):
     """Play one episode. The episode ends when the environment says so: the car reached the
-    finish line, crashed, broke the double-line rule, missed the U-turn, or the (generous)
-    time limit ran out."""
+    finish line, crashed, crossed the double line, got stuck, or the step limit was reached."""
     state = env.reset(scenario)
     total_reward = 0.0
     losses = []
@@ -105,7 +111,7 @@ def run_episode(env, agent, scenario, flags, clock, training, hud_prefix):
     brake_actions = 0
     speed_sum = 0.0
     step = 0
-    info = {"outcome": "running", "violations": 0, "u_turn_done": False}
+    info = {"outcome": "running", "violations": 0}
 
     while True:
         handle_events(flags)
@@ -153,7 +159,6 @@ def run_episode(env, agent, scenario, flags, clock, training, hud_prefix):
         "brake_actions": brake_actions,
         "auto_brakes": overrides,
         "violations": info["violations"],
-        "u_turn_done": bool(info["u_turn_done"]),
         "avg_speed": speed_sum / max(1, step),
     }
 
@@ -161,6 +166,77 @@ def run_episode(env, agent, scenario, flags, clock, training, hud_prefix):
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Best-model tracking
+# ---------------------------------------------------------------------------
+def validate(env, agent, clock, flags):
+    """Quiet test on all four scenarios using the validation seeds. Returns (score, summaries)
+    or None if the user quit. The random generators are restored afterwards so that
+    checking the model never changes how training would have gone."""
+    saved_python = random.getstate()
+    saved_numpy = np.random.get_state()
+    local_flags = {"running": flags["running"], "render": False, "fast": True}
+
+    summaries = []
+    for scenario in config.SCENARIO_ORDER:
+        results = []
+        for i in range(config.VALIDATION_EPISODES):
+            seed = config.VALIDATION_SEED + i
+            random.seed(seed)
+            np.random.seed(seed)
+            result = run_episode(env, agent, scenario, local_flags, clock, False, {})
+            if result["aborted"]:
+                flags["running"] = False
+                random.setstate(saved_python)
+                np.random.set_state(saved_numpy)
+                return None
+            results.append(result)
+        summaries.append(summarize(scenario, results))
+
+    random.setstate(saved_python)
+    np.random.set_state(saved_numpy)
+    total = overall(summaries)
+    return (total["success_pct"], total["avg_reward"]), summaries
+
+
+def load_best_score():
+    """Score of the best model saved by an earlier run (used when training continues from a checkpoint)."""
+    try:
+        with open(config.BEST_INFO_PATH) as handle:
+            data = json.load(handle)
+        return (float(data["success_pct"]), float(data["avg_reward"]))
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def check_best(env, agent, clock, flags, progress, where):
+    """Test the current agent and keep it as the best model if it beats the best so far.
+    Returns False if the user quit."""
+    outcome = validate(env, agent, clock, flags)
+    if outcome is None:
+        return False
+    score, summaries = outcome
+    best = progress.get("best_score")
+    detail = ", ".join("{} {:.0f}%".format(s["scenario"], s["success_pct"]) for s in summaries)
+    if best is None or score > best:
+        progress["best_score"] = score
+        agent.save(config.BEST_MODEL_PATH, episode=progress["episode"], best_reward=score[1])
+        with open(config.BEST_INFO_PATH, "w") as handle:
+            json.dump({
+                "episode": progress["episode"],
+                "where": where,
+                "success_pct": score[0],
+                "avg_reward": score[1],
+                "per_scenario": summaries,
+            }, handle, indent=2)
+        print("  >> NEW BEST MODEL ({}): success {:.1f}%, reward {:.1f} [{}] -> {}".format(
+            where, score[0], score[1], detail, config.BEST_MODEL_PATH))
+    else:
+        print("  >> check ({}): success {:.1f}%, reward {:.1f} [{}] - best stays {:.1f}%".format(
+            where, score[0], score[1], detail, best[0]))
+    return True
+
+
 def build_stages(args):
     """List of (stage name, episodes) to train, in order."""
     if args.stage is not None:
@@ -238,13 +314,19 @@ def train_stage(env, agent, clock, flags, stage_name, episodes, stage_index, pro
             "brake_actions": result["brake_actions"],
             "auto_brakes": result["auto_brakes"],
             "violations": result["violations"],
-            "u_turn_done": int(result["u_turn_done"]),
             "avg_speed": round(result["avg_speed"], 3),
         })
         log_file.flush()
 
         if progress["episode"] % config.SAVE_EVERY_EPISODES == 0:
             agent.save(config.LAST_MODEL_PATH, episode=progress["episode"], best_reward=best_reward)
+
+        if progress["episode"] % config.VALIDATE_EVERY_EPISODES == 0:
+            if not check_best(env, agent, clock, flags, progress, "{} episode {}".format(stage_name, episode)):
+                return False
+
+    if not check_best(env, agent, clock, flags, progress, "end of {}".format(stage_name)):
+        return False
 
     stage_path = os.path.join(config.CHECKPOINT_DIR, "dqn_after_{}.pth".format(stage_name))
     agent.save(stage_path, episode=progress["episode"], best_reward=best_reward)
@@ -257,73 +339,6 @@ def train_stage(env, agent, clock, flags, stage_name, episodes, stage_index, pro
 # ---------------------------------------------------------------------------
 # Final test on all four scenarios
 # ---------------------------------------------------------------------------
-def summarize(scenario, results):
-    count = len(results)
-
-    def share(outcomes):
-        return 100.0 * sum(1 for r in results if r["outcome"] in outcomes) / count
-
-    summary = {
-        "scenario": scenario,
-        "episodes": count,
-        "success_pct": share(("destination",)),
-        "collision_pct": share(("collision",)),
-        "double_line_pct": share(("double_line",)),
-        "missed_turn_pct": share(("missed_turn",)),
-        "timeout_pct": share(("stuck", "timeout")),
-        "avg_reward": float(np.mean([r["reward"] for r in results])),
-        "avg_steps": float(np.mean([r["steps"] for r in results])),
-        "avg_speed": float(np.mean([r["avg_speed"] for r in results])),
-        "avg_auto_brakes": float(np.mean([r["auto_brakes"] for r in results])),
-        "u_turn_done_pct": (
-            100.0 * sum(1 for r in results if r["u_turn_done"]) / count
-            if config.SCENARIOS[scenario]["u_turn"] else None
-        ),
-    }
-    return summary
-
-
-def print_table(summaries):
-    header = "{:<14} {:>5} {:>8} {:>10} {:>9} {:>10} {:>9} {:>10} {:>9} {:>8} {:>11}".format(
-        "Scenario", "Eps", "Success%", "Collision%", "LineCross%", "MissedTurn%", "Timeout%",
-        "AvgReward", "AvgSteps", "AvgSpeed", "AutoBrk/ep")
-    print("")
-    print("FINAL TEST RESULTS (greedy agent, no exploration, no learning)")
-    print(header)
-    print("-" * len(header))
-    for s in summaries:
-        print("{:<14} {:>5d} {:>8.1f} {:>10.1f} {:>9.1f} {:>10.1f} {:>9.1f} {:>10.1f} {:>9.0f} {:>8.2f} {:>11.1f}".format(
-            s["scenario"], s["episodes"], s["success_pct"], s["collision_pct"], s["double_line_pct"],
-            s["missed_turn_pct"], s["timeout_pct"], s["avg_reward"], s["avg_steps"], s["avg_speed"],
-            s["avg_auto_brakes"]))
-    for s in summaries:
-        if s["u_turn_done_pct"] is not None:
-            print("U-turn completed in {:.1f}% of '{}' test episodes.".format(s["u_turn_done_pct"], s["scenario"]))
-
-
-def save_test_results(summaries, model_description, episodes):
-    os.makedirs(config.RESULTS_DIR, exist_ok=True)
-    fields = [
-        "scenario", "episodes", "success_pct", "collision_pct", "double_line_pct", "missed_turn_pct",
-        "timeout_pct", "avg_reward", "avg_steps", "avg_speed", "avg_auto_brakes", "u_turn_done_pct",
-    ]
-    with open(TEST_CSV_PATH, "w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        for s in summaries:
-            row = {key: ("" if s[key] is None else (round(s[key], 3) if isinstance(s[key], float) else s[key]))
-                   for key in fields}
-            writer.writerow(row)
-    with open(TEST_JSON_PATH, "w") as handle:
-        json.dump({
-            "model": model_description,
-            "test_episodes_per_scenario": episodes,
-            "test_seed": config.TEST_SEED,
-            "results": summaries,
-        }, handle, indent=2)
-    print("Saved {} and {}".format(TEST_CSV_PATH, TEST_JSON_PATH))
-
-
 def final_test(env, agent, clock, flags, scenarios, episodes, model_description):
     """Greedy test on the given scenarios. Test episode i always uses seed TEST_SEED + i,
     so every model faces exactly the same traffic."""
@@ -349,8 +364,8 @@ def final_test(env, agent, clock, flags, scenarios, episodes, model_description)
                 result["outcome"]))
         summaries.append(summarize(scenario, results))
 
-    print_table(summaries)
-    save_test_results(summaries, model_description, episodes)
+    print_table(summaries, "FINAL TEST RESULTS (greedy agent, no exploration, no learning)")
+    save_results(summaries, TEST_CSV_PATH, TEST_JSON_PATH, model_description, episodes, config.TEST_SEED)
     return summaries
 
 
@@ -399,7 +414,7 @@ def main():
             stages = build_stages(args)
             print("Training plan: " + ", ".join("{} x{}".format(name, count) for name, count in stages))
 
-            progress = {"episode": 0}
+            progress = {"episode": 0, "best_score": load_best_score() if args.load else None}
             completed = True
             with open(TRAIN_LOG_PATH, "w", newline="") as log_file:
                 log_writer = csv.DictWriter(log_file, fieldnames=TRAIN_LOG_FIELDS)
@@ -415,10 +430,15 @@ def main():
                 print("")
                 print("Training finished. Final model saved to {}".format(config.FINAL_MODEL_PATH))
                 print("Training log saved to {}".format(TRAIN_LOG_PATH))
+                print("Best model saved to {} - this is the one test_run.py shows".format(config.BEST_MODEL_PATH))
+                print("To present the trained agent, run: python test_run.py")
                 if not args.no_test and flags["running"]:
+                    test_path = config.BEST_MODEL_PATH if os.path.isfile(config.BEST_MODEL_PATH) \
+                        else config.FINAL_MODEL_PATH
+                    agent.load(test_path)
                     agent.epsilon = 0.0
-                    final_test(env, agent, clock, flags, list(config.SCENARIO_ORDER), test_episodes,
-                               config.FINAL_MODEL_PATH)
+                    print("Final test uses {}".format(test_path))
+                    final_test(env, agent, clock, flags, list(config.SCENARIO_ORDER), test_episodes, test_path)
             else:
                 print("Stopped early. Latest model: {}".format(config.LAST_MODEL_PATH))
     except KeyboardInterrupt:

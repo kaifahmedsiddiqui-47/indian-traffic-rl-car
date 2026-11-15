@@ -6,7 +6,9 @@ Coordinate system
 * s is the position along the road in world units (pixels). Forward lanes move
   towards increasing s, opposite lanes towards decreasing s.
 * The camera follows the ego car, so screen_y = EGO_SCREEN_Y - (s - ego_s).
-* Lane layout and road edges come from a Road object (models/road.py).
+* Lane layout and road edges come from a Road object (models/road.py). On a winding
+  road the centre line moves sideways, so every vehicle also keeps `off`, its sideways
+  distance from the centre line; NPC vehicles drive along the road by holding `off`.
 """
 
 import math
@@ -146,17 +148,18 @@ class Vehicle(Body):
         length = spec["length"]
 
         if parked:
-            x = road.parked_x(lane, width)
+            off = road.parked_off(lane, width)
         else:
-            x = road.jittered_lane_x(lane, width)
+            off = road.jittered_lane_off(lane, width)
 
-        super().__init__(x, s, width, length)
+        super().__init__(road.x_from_offset(off, s), s, width, length)
 
         self.road = road
         self.vtype = vtype
         self.lane = lane
+        self.off = off
         self.target_lane = lane
-        self.target_x = self.x
+        self.target_off = off
         self.direction = road.lane_direction(lane)
         self.parked = parked
         self.speed = 0.0 if parked else float(speed)
@@ -165,9 +168,13 @@ class Vehicle(Body):
         self.cooldown = 0
         self.stuck = 0
 
-    def start_lane_change(self, new_lane, new_x):
+    @property
+    def target_x(self):
+        return self.road.x_from_offset(self.target_off, self.s)
+
+    def start_lane_change(self, new_lane, new_off):
         self.target_lane = new_lane
-        self.target_x = new_x
+        self.target_off = new_off
         self.cooldown = config.LANE_CHANGE_COOLDOWN
 
     def advance(self):
@@ -178,12 +185,14 @@ class Vehicle(Body):
         self.s += self.direction * self.speed
 
         if self.target_lane != self.lane:
-            dx = self.target_x - self.x
+            dx = self.target_off - self.off
             step = min(config.LANE_CHANGE_SPEED, abs(dx))
-            self.x += math.copysign(step, dx)
-            if abs(self.target_x - self.x) < 0.01:
-                self.x = self.target_x
+            self.off += math.copysign(step, dx)
+            if abs(self.target_off - self.off) < 0.01:
+                self.off = self.target_off
                 self.lane = self.target_lane
+
+        self.x = self.road.x_from_offset(self.off, self.s)
 
         if self.cooldown > 0:
             self.cooldown -= 1
@@ -215,8 +224,12 @@ class EgoCar(Body):
         self.overridden = False
 
     @property
+    def off(self):
+        return self.road.offset(self.x, self.s)
+
+    @property
     def lane(self):
-        return self.road.lane_from_x(self.x)
+        return self.road.lane_from_offset(self.off)
 
     def plan_motion(self, lateral_dir, lateral_speed, mode):
         """Return (x, s, speed) after one step of the given motion without changing the car."""
@@ -239,8 +252,8 @@ class EgoCar(Body):
         steer = max(config.EGO_MIN_STEER, min(1.0, speed / config.EGO_STEER_FULL_SPEED))
         half = self.width / 2.0
         x = self.x + lateral_dir * lateral_speed * steer
-        x = max(self.road.left + half, min(self.road.right - half, x))
         s = self.s + speed
+        x = max(self.road.left_at(s) + half, min(self.road.right_at(s) - half, x))
         return x, s, speed
 
     def apply_motion(self, lateral_dir, lateral_speed, mode):

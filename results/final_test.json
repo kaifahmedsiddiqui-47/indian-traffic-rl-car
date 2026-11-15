@@ -1,0 +1,67 @@
+{
+  "model": "D:\\traffic_rl_car\\checkpoints\\dqn_final.pth",
+  "test_episodes_per_scenario": 20,
+  "test_seed": 1234,
+  "results": [
+    {
+      "scenario": "highway",
+      "episodes": 20,
+      "success_pct": 0.0,
+      "collision_pct": 0.0,
+      "double_line_pct": 15.0,
+      "timeout_pct": 85.0,
+      "avg_reward": -973.5745000000001,
+      "avg_steps": 582.6,
+      "avg_speed": 1.1700819188576637,
+      "avg_auto_brakes": 327.85
+    },
+    {
+      "scenario": "heavy_traffic",
+      "episodes": 20,
+      "success_pct": 5.0,
+      "collision_pct": 0.0,
+      "double_line_pct": 5.0,
+      "timeout_pct": 90.0,
+      "avg_reward": -1099.9434489795917,
+      "avg_steps": 642.0,
+      "avg_speed": 0.552651946888485,
+      "avg_auto_brakes": 352.1
+    },
+    {
+      "scenario": "single_lane",
+      "episodes": 20,
+      "success_pct": 100.0,
+      "collision_pct": 0.0,
+      "double_line_pct": 0.0,
+      "timeout_pct": 0.0,
+      "avg_reward": 276.70024489795935,
+      "avg_steps": 525.2,
+      "avg_speed": 2.135068536240671,
+      "avg_auto_brakes": 0.0
+    },
+    {
+      "scenario": "curvy_road",
+      "episodes": 20,
+      "success_pct": 90.0,
+      "collision_pct": 0.0,
+      "double_line_pct": 5.0,
+      "timeout_pct": 5.0,
+      "avg_reward": 252.97313061955228,
+      "avg_steps": 502.35,
+      "avg_speed": 2.2747353109849304,
+      "avg_auto_brakes": 0.0
+    },
+    {
+      "scenario": "ALL",
+      "episodes": 80,
+      "success_pct": 48.75,
+      "collision_pct": 0.0,
+      "double_line_pct": 6.25,
+      "timeout_pct": 45.0,
+      "avg_reward": -385.96114336552,
+      "avg_steps": 563.0375,
+      "avg_speed": 1.5331344282429373,
+      "avg_auto_brakes": 169.9875
+    }
+  ]
+}

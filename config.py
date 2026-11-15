@@ -3,9 +3,9 @@
 All tunable numbers live here so that the environment, the agent and the
 training loop never contain magic constants.  World units are pixels.
 
-The simulator now has four driving scenarios (see SCENARIOS below). The agent is
+The simulator has four driving scenarios (see SCENARIOS below). The agent is
 trained on each scenario in turn, each with its own number of episodes, and is
-then tested on all four.
+then tested on all four. Every episode is limited to MAX_STEPS steps.
 """
 
 import os
@@ -18,6 +18,8 @@ CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 LAST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "dqn_last.pth")
 FINAL_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "dqn_final.pth")
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "dqn_best.pth")       # best model found during training
+BEST_INFO_PATH = os.path.join(RESULTS_DIR, "best_model.json")        # when and how well it did
 SAVE_EVERY_EPISODES = 25
 
 # ---------------------------------------------------------------------------
@@ -43,14 +45,17 @@ SEED = 42
 # ---------------------------------------------------------------------------
 # Staged training and the final test
 # ---------------------------------------------------------------------------
-SCENARIO_ORDER = ["highway", "heavy_traffic", "single_lane", "u_turn"]
+SCENARIO_ORDER = ["highway", "heavy_traffic", "single_lane", "curvy_road"]
+
+# Every episode ends after this many steps at the latest.
+MAX_STEPS = 1000
 
 # Episodes the agent spends in each scenario (edit one entry to change only that scenario).
 EPISODES_PER_SCENARIO = {
     "highway": EPISODES,
     "heavy_traffic": EPISODES,
     "single_lane": EPISODES,
-    "u_turn": EPISODES,
+    "curvy_road": EPISODES,
 }
 
 # Optional extra phase after the four scenarios: every episode picks a random scenario,
@@ -64,11 +69,19 @@ STAGE_EPSILON_RESTART = 0.6
 FINAL_TEST_EPISODES = 20       # greedy test episodes per scenario at the end
 TEST_SEED = 1234               # test episode i uses seed TEST_SEED + i, so tests are repeatable
 
+# Best-model tracking: during training the agent is quietly tested on all four scenarios
+# (with its own seeds, different from the presentation seeds) and the highest scoring
+# version is kept as BEST_MODEL_PATH. The score is the overall success rate, then the reward.
+VALIDATE_EVERY_EPISODES = 50   # also checked at the end of every scenario stage
+VALIDATION_EPISODES = 3        # per scenario, so 12 quiet episodes per check
+VALIDATION_SEED = 777000
+
 # ---------------------------------------------------------------------------
 # State / action spaces
 # ---------------------------------------------------------------------------
-# State: [car_x, mission_progress, front_distance, left_gap, right_gap, current_lane,
-#         speed, closing_speed, u_turn_gap_distance, u_turn_done]
+# State: [car_x, trip_progress, front_distance, left_gap, right_gap, current_lane,
+#         speed, closing_speed, road_slope_here, road_slope_ahead]
+# (the last two tell the car which way a winding road bends; they are 0 on straight roads)
 STATE_SIZE = 10
 ACTION_SIZE = 7
 NORMALIZE_STATE = True         # False returns raw pixel values instead of normalised values
@@ -165,11 +178,11 @@ DASH_GAP = 26
 #   spawn_probability  chance per step that a new vehicle is added when below target
 #   parked             whether parked vehicles line the kerbs
 #   destination        finish line distance (px from the start)
-#   max_steps          safety cap on episode length (generous: slow traffic needs time)
-#   u_turn             True when the median has an opening where the car must turn back
-#   u_turn_gap_center  position of the opening along the road
-#   u_turn_gap_length  length of the opening
-#   return_finish      finish line position (in the original road coordinates) after the U-turn
+#   max_steps          episode length limit
+#   curve              None for a straight road, otherwise the winding-road settings:
+#                      amplitude (max sideways swing, px), wavelength (px of road per full
+#                      wave) and ramp (px of straight road before the bends start); the
+#                      phase and the exact size change a little in every episode
 # ---------------------------------------------------------------------------
 SCENARIOS = {
     "highway": {
@@ -184,8 +197,8 @@ SCENARIOS = {
         "spawn_probability": 0.25,
         "parked": True,
         "destination": 2000.0,
-        "max_steps": 3000,
-        "u_turn": False,
+        "max_steps": MAX_STEPS,
+        "curve": None,
     },
     "heavy_traffic": {
         "title": "Heavy slow traffic - 3 lanes each way",
@@ -198,9 +211,9 @@ SCENARIOS = {
         "spawn_gap": 26.0,
         "spawn_probability": 0.4,
         "parked": True,
-        "destination": 1400.0,
-        "max_steps": 8000,
-        "u_turn": False,
+        "destination": 800.0,
+        "max_steps": MAX_STEPS,
+        "curve": None,
     },
     "single_lane": {
         "title": "Narrow road - 1 lane each way",
@@ -213,36 +226,38 @@ SCENARIOS = {
         "spawn_gap": 45.0,
         "spawn_probability": 0.25,
         "parked": False,
-        "destination": 1800.0,
-        "max_steps": 6000,
-        "u_turn": False,
+        "destination": 1100.0,
+        "max_steps": MAX_STEPS,
+        "curve": None,
     },
-    "u_turn": {
-        "title": "U-turn road - 2 lanes each way",
-        "lanes_per_side": 2,
-        "lane_width": 78,
-        "jitter_scale": 1.0,
-        "forward_vehicles": 6,
-        "opposite_vehicles": 5,
+    "curvy_road": {
+        "title": "Curvy narrow road - 1 lane each way",
+        "lanes_per_side": 1,
+        "lane_width": 92,
+        "jitter_scale": 0.0,
+        "forward_vehicles": 4,
+        "opposite_vehicles": 4,
         "speed_scale": 0.9,
-        "spawn_gap": 45.0,
-        "spawn_probability": 0.25,
-        "parked": True,
-        "destination": 0.0,
-        "max_steps": 6000,
-        "u_turn": True,
-        "u_turn_gap_center": 650.0,
-        "u_turn_gap_length": 240.0,
-        "return_finish": 60.0,
+        "spawn_gap": 60.0,
+        "spawn_probability": 0.2,
+        "parked": False,
+        "destination": 1100.0,
+        "max_steps": MAX_STEPS,
+        "curve": {"amplitude": 62.0, "wavelength": 950.0, "ramp": 350.0},
     },
 }
 
+# Winding roads: how the state describes the bends
+CURVE_MAX_SLOPE = 0.6          # road slope (sideways px per px of road) that maps to 1.0 in the state
+CURVE_LOOKAHEAD = 120.0        # how far ahead the "road_slope_ahead" value looks (px)
+CURVE_AMPLITUDE_JITTER = (0.85, 1.0)    # per-episode scale of the amplitude
+CURVE_WAVELENGTH_JITTER = (0.85, 1.15)  # per-episode scale of the wavelength
+
 # ---------------------------------------------------------------------------
-# Time limits: the agent gets plenty of time. An episode ends early only when the
-# scenario's max_steps cap is reached or the car makes no real forward progress for
-# a very long time.
+# Time limits: every episode is capped at MAX_STEPS. An episode also ends early when
+# the car makes no real forward progress for a while.
 # ---------------------------------------------------------------------------
-STUCK_WINDOW_STEPS = 600       # steps without enough progress before the episode is ended as "stuck"
+STUCK_WINDOW_STEPS = 400       # steps without enough progress before the episode is ended as "stuck"
 STUCK_MIN_PROGRESS = 20.0      # px of forward progress that counts as "not stuck"
 
 # ---------------------------------------------------------------------------
@@ -289,7 +304,7 @@ PARKED_TYPE_WEIGHTS = {"car": 0.45, "auto": 0.20, "bike": 0.15, "truck": 0.12, "
 SPAWN_AHEAD = 800.0            # moving traffic appears this far ahead of the ego car
 DESPAWN_BEHIND = 300.0
 INITIAL_CLEAR_ZONE = 160.0     # nothing spawns this close to the ego car at reset
-POPULATE_ATTEMPTS = 900        # tries when filling the road at reset or after a U-turn
+POPULATE_ATTEMPTS = 900        # tries when filling the road at reset
 
 SAFE_GAP_BASE = 18.0           # safe gap = base + speed * time
 SAFE_GAP_TIME = 10.0
@@ -317,7 +332,6 @@ FRONT_SENSOR_RANGE = 300.0
 SIDE_SENSOR_RANGE = 160.0
 SIDE_LONGITUDINAL_MARGIN = 45.0
 FRONT_BAND_MARGIN = 4.0
-GAP_SENSOR_RANGE = 800.0       # how far ahead the car "sees" the U-turn opening
 
 # ---------------------------------------------------------------------------
 # Rewards (as requested)
@@ -342,18 +356,12 @@ CLOSING_SPEED_THRESHOLD = 0.5  # front gap only counts as "very close" while app
 TIMEOUT_PENALTY = -100.0       # running out of steps (or being stuck) without reaching the finish line
 
 # Double yellow line: no crossing and therefore no overtaking, in any condition.
-# The only exception is the U-turn opening in the U-turn scenario.
 PENALTY_DOUBLE_LINE = -100.0       # when the car crosses the double line
 PENALTY_DOUBLE_LINE_STEP = -5.0    # every further step spent over the line (when the episode continues)
 END_EPISODE_ON_VIOLATION = True    # crossing the line ends the episode as a failure
 
-# U-turn scenario
-REWARD_U_TURN = 100.0              # completing the U-turn through the opening
-PENALTY_MISSED_TURN = -100.0       # driving past the opening without turning back
-MISSED_TURN_MARGIN = 120.0         # px beyond the end of the opening before the turn counts as missed
-U_TURN_ALIGN_RANGE = 300.0         # distance before the opening at which the car is nudged towards the median
-U_TURN_SHAPING_FORWARD = 0.03      # reward per px of progress towards the opening
-U_TURN_SHAPING_LATERAL = 0.08      # reward per px of sideways progress towards the opening's crossing point
+# Winding road: staying near the middle of the lane through the bends
+REWARD_LANE_CENTER = 0.5           # per step, scaled by how well the car is centred and by its speed
 
 # ---------------------------------------------------------------------------
 # Colours

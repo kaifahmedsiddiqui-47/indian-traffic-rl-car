@@ -1,0 +1,6 @@
+scenario,episodes,success_pct,collision_pct,double_line_pct,timeout_pct,avg_reward,avg_steps,avg_speed,avg_auto_brakes
+highway,20,0.0,0.0,15.0,85.0,-973.575,582.6,1.17,327.85
+heavy_traffic,20,5.0,0.0,5.0,90.0,-1099.943,642.0,0.553,352.1
+single_lane,20,100.0,0.0,0.0,0.0,276.7,525.2,2.135,0.0
+curvy_road,20,90.0,0.0,5.0,5.0,252.973,502.35,2.275,0.0
+ALL,80,48.75,0.0,6.25,45.0,-385.961,563.038,1.533,169.988

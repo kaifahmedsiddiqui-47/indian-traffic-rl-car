@@ -4,7 +4,7 @@ Scenarios (see config.SCENARIOS):
     highway        3 lanes each way, normal traffic
     heavy_traffic  3 lanes each way, dense slow-moving traffic
     single_lane    1 lane each way, no overtaking possible
-    u_turn         2 lanes each way, with an opening in the median for a U-turn
+    curvy_road     1 lane each way on a road that winds from side to side
 
 Layout (left-hand traffic):
     lanes 0 .. n-1  : forward lanes (same direction as the ego car)
@@ -15,10 +15,10 @@ Traffic: bikes, autos, cars, buses and trucks. Moving vehicles keep a safe
 distance, follow the vehicle in front and change lane around obstacles.
 Parked vehicles sit at the kerb in the outermost lanes.
 
-U-turn: in the u_turn scenario the car must drive to the opening in the median,
-cross through it into the oncoming lanes and turn back. When that happens the whole
-world is rotated by 180 degrees around the car, so the car keeps driving "up the
-screen" in what is now its own direction of travel, towards the finish line.
+Winding road: the road's centre line swings sideways as the car drives forward, so the
+car has to keep steering to stay in its lane. Lanes, kerbs, sensors and the double line
+are all measured as sideways offsets from the centre line, so traffic and the safety
+layer behave the same way on bends as on straight roads.
 """
 
 import math
@@ -61,9 +61,6 @@ class TrafficEnv:
         self.spec = None
         self.road = None
         self.max_steps = 0
-        self.has_u_turn = False
-        self.gap_min = 0.0
-        self.gap_max = 0.0
 
         self.ego = None
         self.vehicles = []
@@ -73,18 +70,13 @@ class TrafficEnv:
         self.front_closing = 0.0
         self.last_override = False
         self.last_info = {}
+        self.hints = ["ESC  quit", "R    toggle render", "F    fast mode"]
 
         self.violations = 0
         self.was_crossing = False
-        self.u_turn_done = False
-        self.gap_active = False
-        self.turn_start_s = 0.0
-        self.turn_banner = 0
         self.finish_s = 0.0
-        self.finish_active = True
         self.progress_mark_s = 0.0
         self.progress_mark_step = 0
-        self.potential = 0.0
 
         self._load_scenario(scenario)
         self.reset()
@@ -100,13 +92,17 @@ class TrafficEnv:
         self.spec = spec
         self.road = Road(spec["lanes_per_side"], spec["lane_width"], spec["jitter_scale"])
         self.max_steps = int(spec["max_steps"])
-        self.has_u_turn = bool(spec["u_turn"])
-        if self.has_u_turn:
-            self.gap_min = spec["u_turn_gap_center"] - spec["u_turn_gap_length"] / 2.0
-            self.gap_max = spec["u_turn_gap_center"] + spec["u_turn_gap_length"] / 2.0
-        else:
-            self.gap_min = 0.0
-            self.gap_max = 0.0
+
+    def _randomise_curve(self):
+        """Give a winding road a fresh phase and size for this episode (straight roads stay straight)."""
+        curve = self.spec.get("curve")
+        if not curve:
+            self.road.set_curve(0.0, 1000.0, 0.0, 300.0)
+            return
+        amplitude = curve["amplitude"] * random.uniform(*config.CURVE_AMPLITUDE_JITTER)
+        wavelength = curve["wavelength"] * random.uniform(*config.CURVE_WAVELENGTH_JITTER)
+        phase = random.uniform(0.0, 2.0 * math.pi)
+        self.road.set_curve(amplitude, wavelength, phase, curve["ramp"])
 
     # ------------------------------------------------------------------
     # Reset and population
@@ -115,8 +111,9 @@ class TrafficEnv:
         if scenario is not None:
             self._load_scenario(scenario)
 
+        self._randomise_curve()
         lane = random.choice(self.road.forward_lanes)
-        self.ego = EgoCar(self.road, self.road.lane_center_x(lane), 0.0)
+        self.ego = EgoCar(self.road, self.road.lane_center_x(lane, 0.0), 0.0)
         self.vehicles = []
         self.steps = 0
         self.visited_lanes = {lane}
@@ -125,16 +122,7 @@ class TrafficEnv:
 
         self.violations = 0
         self.was_crossing = False
-        self.u_turn_done = False
-        self.gap_active = self.has_u_turn
-        self.turn_start_s = 0.0
-        self.turn_banner = 0
-        if self.has_u_turn:
-            self.finish_s = float(self.spec["return_finish"])
-            self.finish_active = False
-        else:
-            self.finish_s = float(self.spec["destination"])
-            self.finish_active = True
+        self.finish_s = float(self.spec["destination"])
         self.progress_mark_s = 0.0
         self.progress_mark_step = 0
 
@@ -142,7 +130,6 @@ class TrafficEnv:
         self._populate_moving()
 
         self.sensors = self._sense()
-        self.potential = self._u_turn_potential()
         self.last_info = {
             "scenario": self.scenario_name,
             "collision": False,
@@ -156,15 +143,11 @@ class TrafficEnv:
             "override": False,
             "violation": False,
             "violations": 0,
-            "u_turn_done": False,
-            "turned": False,
         }
         return self._get_state()
 
     def _world_end(self):
         """How far along the road parked vehicles are placed."""
-        if self.has_u_turn:
-            return self.gap_max + 600.0
         return self.finish_s + config.PARKED_END_EXTRA
 
     def _populate_parked(self):
@@ -219,25 +202,26 @@ class TrafficEnv:
         spec = config.VEHICLE_TYPES[vtype]
         speed = random.uniform(spec["min_speed"], spec["max_speed"]) * self.spec["speed_scale"]
         vehicle = Vehicle(self.road, vtype, lane, s, speed)
-        if self._region_clear(vehicle.x, vehicle.s, vehicle.width, vehicle.length,
+        if self._region_clear(vehicle.off, vehicle.s, vehicle.width, vehicle.length,
                               ignore=None, long_clearance=self.spec["spawn_gap"],
                               lat_margin=2.0, include_ego=True):
             self.vehicles.append(vehicle)
             return True
         return False
 
-    def _region_clear(self, x, s, width, length, ignore, long_clearance, lat_margin, include_ego):
-        """True when no other vehicle occupies the rectangle (plus the given clearance)."""
+    def _region_clear(self, off, s, width, length, ignore, long_clearance, lat_margin, include_ego):
+        """True when no other vehicle occupies the rectangle (plus the given clearance).
+        `off` is the sideways offset from the road's centre line."""
         for other in self.vehicles:
             if other is ignore:
                 continue
             if abs(other.s - s) - (other.length + length) / 2.0 >= long_clearance:
                 continue
-            if abs(other.x - x) < (other.width + width) / 2.0 + lat_margin:
+            if abs(other.off - off) < (other.width + width) / 2.0 + lat_margin:
                 return False
         if include_ego and self.ego is not None:
             if abs(self.ego.s - s) - (self.ego.length + length) / 2.0 < long_clearance:
-                if abs(self.ego.x - x) < (self.ego.width + width) / 2.0 + lat_margin:
+                if abs(self.ego.off - off) < (self.ego.width + width) / 2.0 + lat_margin:
                     return False
         return True
 
@@ -266,7 +250,7 @@ class TrafficEnv:
     @staticmethod
     def _gap_ahead(vehicle, other):
         """Bumper-to-bumper gap to `other` if it is in front of `vehicle`, else None."""
-        if abs(other.x - vehicle.x) >= (other.width + vehicle.width) / 2.0 + config.FOLLOW_LATERAL_MARGIN:
+        if abs(other.off - vehicle.off) >= (other.width + vehicle.width) / 2.0 + config.FOLLOW_LATERAL_MARGIN:
             return None
         if vehicle.direction > 0:
             if other.s <= vehicle.s:
@@ -298,7 +282,7 @@ class TrafficEnv:
 
         return best_gap, best_speed
 
-    def _lane_change_path_clear(self, vehicle, new_x):
+    def _lane_change_path_clear(self, vehicle, new_off):
         """True when the area the vehicle will sweep while changing lane is free.
 
         The swept area covers the new sideways territory and extends along the road
@@ -306,14 +290,14 @@ class TrafficEnv:
         Vehicles that are themselves changing lane also block their destination.
         """
         half = vehicle.width / 2.0
-        if new_x < vehicle.x:
-            x_lo = new_x - half - 2.0
-            x_hi = vehicle.x - half
+        if new_off < vehicle.off:
+            x_lo = new_off - half - 2.0
+            x_hi = vehicle.off - half
         else:
-            x_lo = vehicle.x + half
-            x_hi = new_x + half + 2.0
+            x_lo = vehicle.off + half
+            x_hi = new_off + half + 2.0
 
-        duration = abs(new_x - vehicle.x) / config.LANE_CHANGE_SPEED
+        duration = abs(new_off - vehicle.off) / config.LANE_CHANGE_SPEED
         travel = max(vehicle.speed, vehicle.target_speed) * duration
         back = vehicle.length / 2.0 + config.LANE_CHANGE_CLEARANCE
         front = vehicle.length / 2.0 + travel + config.LANE_CHANGE_CLEARANCE * 0.5
@@ -327,7 +311,9 @@ class TrafficEnv:
         for other in others:
             if other is vehicle:
                 continue
-            o_x_min, o_x_max, o_s_min, o_s_max = other.bounds()
+            _, _, o_s_min, o_s_max = other.bounds()
+            o_x_min = other.off - other.width / 2.0
+            o_x_max = other.off + other.width / 2.0
 
             # the other vehicle keeps moving during the manoeuvre (e.g. a faster car closing in from behind)
             other_speed = getattr(other, "target_speed", config.EGO_CRUISE_SPEED)
@@ -339,9 +325,9 @@ class TrafficEnv:
                 continue
             if o_x_max > x_lo and o_x_min < x_hi:
                 return False
-            target_x = getattr(other, "target_x", None)
-            if target_x is not None and other.target_lane != other.lane:
-                if target_x + other.width / 2.0 > x_lo and target_x - other.width / 2.0 < x_hi:
+            target_off = getattr(other, "target_off", None)
+            if target_off is not None and other.target_lane != other.lane:
+                if target_off + other.width / 2.0 > x_lo and target_off - other.width / 2.0 < x_hi:
                     return False
         return True
 
@@ -352,9 +338,9 @@ class TrafficEnv:
         ]
         random.shuffle(candidates)
         for lane in candidates:
-            new_x = self.road.jittered_lane_x(lane, vehicle.width)
-            if self._lane_change_path_clear(vehicle, new_x):
-                vehicle.start_lane_change(lane, new_x)
+            new_off = self.road.jittered_lane_off(lane, vehicle.width)
+            if self._lane_change_path_clear(vehicle, new_off):
+                vehicle.start_lane_change(lane, new_off)
                 return True
         return False
 
@@ -398,101 +384,47 @@ class TrafficEnv:
         self.vehicles = survivors
 
     # ------------------------------------------------------------------
-    # Double line and U-turn helpers
+    # Double line
     # ------------------------------------------------------------------
-    def _in_gap(self, s):
-        return self.gap_active and self.gap_min <= s <= self.gap_max
-
     def _crossing_line(self, x, s):
-        """True when an ego-sized car at (x, s) touches or passes the double line outside the opening."""
+        """True when an ego-sized car at (x, s) touches or passes the double line."""
         half = self.ego.width / 2.0
-        return (x + half > self.road.divider_x) and not self._in_gap(s)
+        return self.road.offset(x, s) + half > 0.0
 
     def _motion_crosses_line(self, motion):
         lateral_dir, lateral_speed, mode = motion
         nx, ns, nv = self.ego.plan_motion(lateral_dir, lateral_speed, mode)
         return self._crossing_line(nx, ns)
 
-    def _u_turn_ready(self):
-        """True when the car has driven fully across the median through the opening."""
-        if not self.has_u_turn or self.u_turn_done:
-            return False
-        ex_min = self.ego.x - self.ego.width / 2.0
-        return self._in_gap(self.ego.s) and ex_min >= self.road.divider_x + 1.0
-
-    def _rotate_world(self):
-        """Complete the U-turn: rotate the whole world 180 degrees around the ego car."""
+    def _lane_centre_error(self):
+        """Distance (px) from the middle of the ego's current lane, as a share of the room it has."""
         road = self.road
-        pivot = self.ego.s
-
-        for vehicle in self.vehicles:
-            vehicle.x = road.mirror_x(vehicle.x)
-            vehicle.s = 2.0 * pivot - vehicle.s
-            vehicle.direction = -vehicle.direction
-            vehicle.lane = road.mirror_lane(vehicle.lane)
-            vehicle.target_lane = road.mirror_lane(vehicle.target_lane)
-            vehicle.target_x = road.mirror_x(vehicle.target_x)
-
-        self.ego.x = road.mirror_x(self.ego.x)
-        self.ego.s = pivot
-
-        self.finish_s = 2.0 * pivot - self.finish_s
-        self.finish_active = True
-        self.turn_start_s = pivot
-        self.u_turn_done = True
-        self.gap_active = False
-        self.was_crossing = False
-        self.visited_lanes = {self.ego.lane}
-        self.turn_banner = 90
-
-        self._populate_moving()
-
-    def _u_turn_potential(self):
-        """Shaping potential that guides the car to the opening and across the median."""
-        if not self.has_u_turn or self.u_turn_done:
-            return 0.0
-        approach = max(0.0, self.gap_min - self.ego.s)
-        near = 1.0 - min(1.0, approach / config.U_TURN_ALIGN_RANGE)
-        target_x = self.road.divider_x + self.road.lane_width / 2.0
-        return (
-            -config.U_TURN_SHAPING_FORWARD * approach
-            - config.U_TURN_SHAPING_LATERAL * near * abs(self.ego.x - target_x)
-        )
+        off = self.ego.off
+        lane = road.lane_from_offset(off)
+        room = max(1.0, road.lane_width / 2.0 - self.ego.width / 2.0)
+        return abs(off - road.lane_center_off(lane)) / room
 
     def _mission_progress(self):
-        """Progress through the whole task, 0 to 1 (a U-turn run is half out, half back)."""
-        if self.has_u_turn:
-            if not self.u_turn_done:
-                return 0.5 * max(0.0, min(1.0, self.ego.s / self.spec["u_turn_gap_center"]))
-            span = max(1.0, self.finish_s - self.turn_start_s)
-            return 0.5 + 0.5 * max(0.0, min(1.0, (self.ego.s - self.turn_start_s) / span))
+        """Progress towards the finish line, 0 to 1."""
         return max(0.0, min(1.0, self.ego.s / self.finish_s))
-
-    def _gap_distance(self):
-        """Signed distance to the start of the opening in px (positive ahead, negative once passed)."""
-        if not self.has_u_turn or self.u_turn_done:
-            return config.GAP_SENSOR_RANGE
-        return max(-config.GAP_SENSOR_RANGE, min(config.GAP_SENSOR_RANGE, self.gap_min - self.ego.s))
 
     # ------------------------------------------------------------------
     # Sensors and state
     # ------------------------------------------------------------------
     def _walls(self):
-        """Left and right limits the car senses: kerbs, or the double line while it is solid."""
-        road = self.road
-        in_gap = self._in_gap(self.ego.s)
-        if self.ego.x < road.divider_x:
-            left_wall = road.left
-            right_wall = road.right if in_gap else road.divider_x
-        else:
-            left_wall = road.left if in_gap else road.divider_x
-            right_wall = road.right
-        return left_wall, right_wall
+        """Left and right limits the car senses, as offsets from the centre line: kerb and double line."""
+        half = self.road.half_width
+        if self.ego.off < 0.0:
+            return -half, 0.0
+        return 0.0, half
 
     def _sense(self):
         """Return (front_distance, left_gap, right_gap) in pixels."""
         ego = self.ego
-        ex_min, ex_max, es_min, es_max = ego.bounds()
+        _, _, es_min, es_max = ego.bounds()
+        ego_off = ego.off
+        ex_min = ego_off - ego.width / 2.0
+        ex_max = ego_off + ego.width / 2.0
         left_wall, right_wall = self._walls()
 
         front = config.FRONT_SENSOR_RANGE
@@ -506,7 +438,9 @@ class TrafficEnv:
         for other in self.vehicles:
             if abs(other.s - ego.s) > config.FRONT_SENSOR_RANGE + 200.0:
                 continue
-            ox_min, ox_max, os_min, os_max = other.bounds()
+            _, _, os_min, os_max = other.bounds()
+            ox_min = other.off - other.width / 2.0
+            ox_max = other.off + other.width / 2.0
 
             if other.s > ego.s and ox_max > band_min and ox_min < band_max:
                 gap = max(0.0, os_min - es_max)
@@ -520,7 +454,7 @@ class TrafficEnv:
                 and os_min < es_max + config.SIDE_LONGITUDINAL_MARGIN
             )
             if longitudinal_near and not lateral_overlap:
-                if other.x < ego.x:
+                if other.off < ego_off:
                     left = min(left, max(0.0, ex_min - ox_max))
                 else:
                     right = min(right, max(0.0, ox_min - ex_max))
@@ -537,12 +471,13 @@ class TrafficEnv:
         ego = self.ego
         road = self.road
         lane = ego.lane
-        car_x = ego.x - road.left
+        car_x = ego.off + road.half_width        # 0 at the left kerb
         progress = self._mission_progress()
-        gap_distance = self._gap_distance()
-        turned_flag = 1.0 if self.u_turn_done else 0.0
+        slope_now = road.slope(ego.s)
+        slope_ahead = road.slope(ego.s + config.CURVE_LOOKAHEAD)
 
         if config.NORMALIZE_STATE:
+            limit = config.CURVE_MAX_SLOPE
             state = [
                 car_x / road.width,
                 progress,
@@ -552,12 +487,12 @@ class TrafficEnv:
                 lane / float(road.num_lanes - 1),
                 min(1.0, ego.speed / config.EGO_CRUISE_SPEED),
                 max(-1.0, min(1.0, self.front_closing / config.EGO_CRUISE_SPEED)),
-                gap_distance / config.GAP_SENSOR_RANGE,
-                turned_flag,
+                max(-1.0, min(1.0, slope_now / limit)),
+                max(-1.0, min(1.0, slope_ahead / limit)),
             ]
         else:
             state = [car_x, progress, front, left, right, float(lane), ego.speed,
-                     self.front_closing, gap_distance, turned_flag]
+                     self.front_closing, slope_now, slope_ahead]
         return np.array(state, dtype=np.float32)
 
     def _check_collision(self):
@@ -572,21 +507,22 @@ class TrafficEnv:
     # Safety layer: predict the next step, brake or stop instead of crashing
     # ------------------------------------------------------------------
     def _predict_others(self):
-        """Predicted (body, velocity along the road) of every nearby vehicle one step ahead."""
+        """Predicted (body, velocity along the road, sideways offset) of every nearby vehicle one step ahead."""
         predicted = []
         for other in self.vehicles:
             if abs(other.s - self.ego.s) > 300.0:
                 continue
-            x = other.x
+            off = other.off
             s = other.s
             velocity = 0.0
             if not other.parked:
                 velocity = other.direction * other.speed
                 s += velocity
                 if other.target_lane != other.lane:
-                    dx = other.target_x - other.x
-                    x += math.copysign(min(config.LANE_CHANGE_SPEED, abs(dx)), dx)
-            predicted.append((Body(x, s, other.width, other.length), velocity))
+                    dx = other.target_off - other.off
+                    off += math.copysign(min(config.LANE_CHANGE_SPEED, abs(dx)), dx)
+            body = Body(self.road.x_from_offset(off, s), s, other.width, other.length)
+            predicted.append((body, velocity, off))
         return predicted
 
     def _motion_is_safe(self, motion, predicted):
@@ -595,17 +531,18 @@ class TrafficEnv:
         nx, ns, nv = self.ego.plan_motion(lateral_dir, lateral_speed, mode)
         ghost = Body(nx, ns, self.ego.width, self.ego.length)
         half = self.ego.width / 2.0
-        band_min = nx - half - config.FRONT_BAND_MARGIN
-        band_max = nx + half + config.FRONT_BAND_MARGIN
+        new_off = self.road.offset(nx, ns)
+        band_min = new_off - half - config.FRONT_BAND_MARGIN
+        band_max = new_off + half + config.FRONT_BAND_MARGIN
         ego_front = ns + self.ego.length / 2.0
 
-        for body, velocity in predicted:
+        for body, velocity, off in predicted:
             if ghost.overlaps(body, shrink=-config.SHIELD_SIDE_MARGIN):
                 return False
             if body.s <= ns:
                 continue
-            bx_min, bx_max, bs_min, bs_max = body.bounds()
-            if bx_max <= band_min or bx_min >= band_max:
+            _, _, bs_min, bs_max = body.bounds()
+            if off + body.width / 2.0 <= band_min or off - body.width / 2.0 >= band_max:
                 continue
             gap = bs_min - ego_front
             closing = nv - velocity
@@ -661,8 +598,6 @@ class TrafficEnv:
 
         self._update_npcs()
         self._spawn_traffic()
-        if self.turn_banner > 0:
-            self.turn_banner -= 1
 
         collided = self._check_collision()
 
@@ -675,11 +610,6 @@ class TrafficEnv:
                 self.violations += 1
             self.was_crossing = crossing
 
-        turned = False
-        if not collided and not crossing and self._u_turn_ready():
-            self._rotate_world()
-            turned = True
-
         self.sensors = self._sense()
         front, left, right = self.sensors
         lane = self.ego.lane
@@ -687,13 +617,6 @@ class TrafficEnv:
         speed_ratio = max(0.0, min(1.0, speed / config.EGO_CRUISE_SPEED))
 
         violated = crossing and config.END_EPISODE_ON_VIOLATION
-        missed = (
-            self.has_u_turn
-            and not self.u_turn_done
-            and not collided
-            and not violated
-            and self.ego.s > self.gap_max + config.MISSED_TURN_MARGIN
-        )
 
         reward = 0.0
         reached = False
@@ -737,21 +660,16 @@ class TrafficEnv:
             if crossing:
                 reward += config.PENALTY_DOUBLE_LINE if new_violation else config.PENALTY_DOUBLE_LINE_STEP
 
-            # U-turn guidance and milestone
-            new_potential = self._u_turn_potential()
-            reward += new_potential - self.potential
-            self.potential = new_potential
-            if turned:
-                reward += config.REWARD_U_TURN
+            # winding road: reward for staying in the middle of the lane
+            if self.road.curved:
+                centring = max(0.0, 1.0 - self._lane_centre_error())
+                reward += config.REWARD_LANE_CENTER * centring * speed_ratio
 
-            if missed:
-                reward += config.PENALTY_MISSED_TURN
-
-            if self.finish_active and self.ego.s >= self.finish_s:
+            if self.ego.s >= self.finish_s:
                 reached = True
                 reward += config.REWARD_DESTINATION
 
-        terminal = collided or violated or missed or reached
+        terminal = collided or violated or reached
 
         # Time limits: a generous cap, plus an "no progress for a very long time" check.
         if self.ego.s >= self.progress_mark_s + config.STUCK_MIN_PROGRESS:
@@ -768,8 +686,6 @@ class TrafficEnv:
             outcome = "collision"
         elif violated:
             outcome = "double_line"
-        elif missed:
-            outcome = "missed_turn"
         elif reached:
             outcome = "destination"
         elif stuck:
@@ -797,8 +713,6 @@ class TrafficEnv:
             "override": override,
             "violation": crossing,
             "violations": self.violations,
-            "u_turn_done": self.u_turn_done,
-            "turned": turned,
         }
         self.last_info = info
         return self._get_state(), float(reward), done, info
@@ -806,7 +720,8 @@ class TrafficEnv:
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
-    def render(self, hud=None):
+    def render(self, hud=None, flip=True):
+        """Draw the current frame. With flip=False the caller draws more on top and flips itself."""
         if self.screen is None:
             return
 
@@ -819,74 +734,100 @@ class TrafficEnv:
 
         self._draw_sensors(surface)
         self.ego.draw(surface)
-        self._draw_banner(surface)
         self._draw_panel(surface, hud)
-        pygame.display.flip()
+        if flip:
+            pygame.display.flip()
 
     def _draw_road(self, surface):
         road = self.road
         height = config.SCREEN_HEIGHT
         surface.fill(config.COLOR_GRASS)
 
-        road_rect = pygame.Rect(int(road.left), 0, int(road.width), height)
-        pygame.draw.rect(surface, config.COLOR_ROAD, road_rect)
+        if road.curved:
+            self._draw_curved_road(surface)
+        else:
+            road_rect = pygame.Rect(int(road.left), 0, int(road.width), height)
+            pygame.draw.rect(surface, config.COLOR_ROAD, road_rect)
 
-        pygame.draw.rect(surface, config.COLOR_CURB, (int(road.left) - 6, 0, 6, height))
-        pygame.draw.rect(surface, config.COLOR_CURB, (int(road.right), 0, 6, height))
+            pygame.draw.rect(surface, config.COLOR_CURB, (int(road.left) - 6, 0, 6, height))
+            pygame.draw.rect(surface, config.COLOR_CURB, (int(road.right), 0, 6, height))
 
+            period = config.DASH_LENGTH + config.DASH_GAP
+            offset = int(self.ego.s % period)
+            for i in range(1, road.num_lanes):
+                if i == road.lanes_per_side:
+                    continue
+                x = int(road.left + i * road.lane_width)
+                y = -period + offset
+                while y < height:
+                    pygame.draw.rect(surface, config.COLOR_LANE_LINE, (x - 1, y, 3, config.DASH_LENGTH))
+                    y += period
+
+            center_x = int(road.divider_x)
+            pygame.draw.rect(surface, config.COLOR_CENTER_LINE, (center_x - 4, 0, 3, height))
+            pygame.draw.rect(surface, config.COLOR_CENTER_LINE, (center_x + 1, 0, 3, height))
+
+        if self.font_small is not None:
+            top_s = self.ego.s + config.EGO_SCREEN_Y - 12
+            centre = int(road.centre_at(top_s))
+            forward_label = self.font_small.render("FORWARD", True, config.COLOR_TEXT_DIM)
+            oncoming_label = self.font_small.render("ONCOMING", True, config.COLOR_TEXT_DIM)
+            surface.blit(forward_label, (int(road.left_at(top_s)) + 8, 6))
+            surface.blit(oncoming_label, (centre + 8, 6))
+
+    def _draw_curved_road(self, surface):
+        """Draw a winding road as strips: one point every few pixels down the screen."""
+        road = self.road
+        height = config.SCREEN_HEIGHT
+        step = 6
+        ys = list(range(-step, height + step * 2, step))
+        centres = [road.centre_at(self.ego.s + (config.EGO_SCREEN_Y - y)) for y in ys]
+        half = road.half_width
+
+        def edge(delta):
+            return [(int(c + delta), y) for c, y in zip(centres, ys)]
+
+        left_edge = edge(-half)
+        right_edge = edge(half)
+        pygame.draw.polygon(surface, config.COLOR_ROAD, left_edge + right_edge[::-1])
+        pygame.draw.lines(surface, config.COLOR_CURB, False, edge(-half - 3), 6)
+        pygame.draw.lines(surface, config.COLOR_CURB, False, edge(half + 3), 6)
+        pygame.draw.lines(surface, config.COLOR_CENTER_LINE, False, edge(-2.5), 3)
+        pygame.draw.lines(surface, config.COLOR_CENTER_LINE, False, edge(2.5), 3)
+
+        # dashed white lines between lanes on the same side (only when a side has several lanes)
         period = config.DASH_LENGTH + config.DASH_GAP
-        offset = int(self.ego.s % period)
         for i in range(1, road.num_lanes):
             if i == road.lanes_per_side:
                 continue
-            x = int(road.left + i * road.lane_width)
-            y = -period + offset
-            while y < height:
-                pygame.draw.rect(surface, config.COLOR_LANE_LINE, (x - 1, y, 3, config.DASH_LENGTH))
-                y += period
-
-        center_x = int(road.divider_x)
-        pygame.draw.rect(surface, config.COLOR_CENTER_LINE, (center_x - 4, 0, 3, height))
-        pygame.draw.rect(surface, config.COLOR_CENTER_LINE, (center_x + 1, 0, 3, height))
-
-        if self.gap_active:
-            top = int(max(0, world_to_screen_y(self.gap_max, self.ego.s)))
-            bottom = int(min(height, world_to_screen_y(self.gap_min, self.ego.s)))
-            if bottom > top:
-                pygame.draw.rect(surface, config.COLOR_ROAD, (center_x - 8, top, 16, bottom - top))
-                y = top
-                while y < bottom:
-                    pygame.draw.rect(surface, config.COLOR_LANE_LINE, (center_x - 1, y, 3, min(12, bottom - y)))
-                    y += 24
-                if self.font_small is not None:
-                    label = self.font_small.render("U-TURN", True, config.COLOR_WARN)
-                    surface.blit(label, (center_x + 12, (top + bottom) // 2 - 8))
-
-        if self.font_small is not None:
-            forward_label = self.font_small.render("FORWARD", True, config.COLOR_TEXT_DIM)
-            oncoming_label = self.font_small.render("ONCOMING", True, config.COLOR_TEXT_DIM)
-            surface.blit(forward_label, (int(road.left) + 8, 6))
-            surface.blit(oncoming_label, (center_x + 8, 6))
+            delta = -half + i * road.lane_width
+            for k in range(-1, height // period + 2):
+                y0 = -period + int(self.ego.s % period) + k * period
+                y1 = y0 + config.DASH_LENGTH
+                pts = [(int(road.centre_at(self.ego.s + (config.EGO_SCREEN_Y - yy)) + delta), yy)
+                       for yy in range(y0, y1 + 1, step)]
+                if len(pts) >= 2:
+                    pygame.draw.lines(surface, config.COLOR_LANE_LINE, False, pts, 3)
 
     def _draw_destination(self, surface):
-        if not self.finish_active:
-            return
         road = self.road
         y = int(world_to_screen_y(self.finish_s, self.ego.s))
         if y < -30 or y > config.SCREEN_HEIGHT + 30:
             return
+        left = int(road.left_at(self.finish_s))
+        right = int(road.right_at(self.finish_s))
         square = 13
         columns = int(road.width) // square + 1
         for row in range(2):
             for col in range(columns):
                 color = (245, 245, 245) if (row + col) % 2 == 0 else (20, 20, 20)
-                rect = pygame.Rect(int(road.left) + col * square, y - row * square, square, square)
-                rect.width = min(square, int(road.right) - rect.left)
+                rect = pygame.Rect(left + col * square, y - row * square, square, square)
+                rect.width = min(square, right - rect.left)
                 if rect.width > 0:
                     pygame.draw.rect(surface, color, rect)
         if self.font is not None:
             label = self.font.render("FINISH", True, (255, 255, 255))
-            surface.blit(label, (int(road.left + road.width / 2) - label.get_width() // 2, y - 46))
+            surface.blit(label, ((left + right) // 2 - label.get_width() // 2, y - 46))
 
     def _draw_sensors(self, surface):
         front, left, right = self.sensors
@@ -909,17 +850,6 @@ class TrafficEnv:
         pygame.draw.line(surface, config.COLOR_WARN, (left_edge, cy), (int(left_edge - left), cy), 1)
         pygame.draw.line(surface, config.COLOR_WARN, (right_edge, cy), (int(right_edge + right), cy), 1)
 
-    def _draw_banner(self, surface):
-        if self.turn_banner > 0 and self.font_big is not None:
-            label = self.font_big.render("U-TURN COMPLETE", True, config.COLOR_GOOD)
-            x = int(self.road.left + self.road.width / 2) - label.get_width() // 2
-            surface.blit(label, (x, 120))
-
-    def _phase_text(self):
-        if self.has_u_turn:
-            return "back to finish" if self.u_turn_done else "go to U-turn"
-        return "drive to finish"
-
     def _draw_panel(self, surface, hud):
         panel = pygame.Rect(config.PANEL_X - 12, 10, config.SCREEN_WIDTH - config.PANEL_X, config.SCREEN_HEIGHT - 20)
         pygame.draw.rect(surface, config.COLOR_PANEL, panel, border_radius=10)
@@ -939,7 +869,7 @@ class TrafficEnv:
         info = self.last_info
         lines.extend([
             ("Scenario", self.scenario_name.replace("_", " ")),
-            ("Phase", self._phase_text()),
+            ("Road", "winding" if self.road.curved else "straight"),
             ("Step", "{}".format(self.steps)),
             ("Lane", "{}".format(self.ego.lane)),
             ("Action", config.ACTION_NAMES.get(self.ego.last_action, "-")),
@@ -967,9 +897,8 @@ class TrafficEnv:
         label = self.font_small.render("Trip progress", True, config.COLOR_TEXT_DIM)
         surface.blit(label, (x, y + 20))
 
-        hints = ["ESC  quit", "R    toggle render", "F    fast mode"]
-        hint_y = config.SCREEN_HEIGHT - 28 - 22 * len(hints)
-        for hint in hints:
+        hint_y = config.SCREEN_HEIGHT - 28 - 22 * len(self.hints)
+        for hint in self.hints:
             surface.blit(self.font_small.render(hint, True, config.COLOR_TEXT_DIM), (x, hint_y))
             hint_y += 22
 
